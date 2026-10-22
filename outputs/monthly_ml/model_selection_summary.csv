@@ -1,0 +1,3 @@
+Target,Selected_Approach,Validation_MAE,Baseline_Validation_MAE
+Temperature,Extra Trees,0.6255229464237911,0.6328007619047619
+Precipitation,Seasonal Climatology Baseline,36.199430654372236,36.199430654372236

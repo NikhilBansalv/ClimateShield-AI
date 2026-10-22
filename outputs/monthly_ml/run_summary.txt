@@ -1,0 +1,10 @@
+ClimateShield AI — Monthly ML pipeline
+Study period: 1991-01-01 to 2025-12-01
+Training: 1991–2015
+Validation: 2016–2020
+Final test: 2021–2025
+
+Temperature: selected approach = Extra Trees
+Precipitation: selected approach = Seasonal Climatology Baseline
+
+These are held-out historical predictions, not forecasts for future years.

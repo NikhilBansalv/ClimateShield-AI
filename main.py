@@ -3,11 +3,18 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from scipy.stats import linregress
-import os
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+ANNUAL_OUTPUT_DIR = BASE_DIR / "outputs" / "annual_data"
+GRAPHS_DIR = ANNUAL_OUTPUT_DIR / "graphs"
+
+GRAPHS_DIR.mkdir(parents=True, exist_ok=True)
 
 # 1. LOAD CCKP DATASETS
-temp = pd.read_csv("data/gw_tsmax.csv")
-rain = pd.read_csv("data/gw_pr.csv")
+temp = pd.read_csv(DATA_DIR / "gw_tsmax.csv")
+rain = pd.read_csv(DATA_DIR / "gw_pr.csv")
 
 print("Temperature dataset shape:", temp.shape)
 print("Rainfall dataset shape:", rain.shape)
@@ -139,7 +146,7 @@ print(climate_df.head())
 
 # 10. SAVE CLEANED DATASET
 climate_df.to_csv(
-    "outputs/ClimateShield_DA1_Cleaned_Dataset_1991_2025.csv",
+    ANNUAL_OUTPUT_DIR / "ClimateShield_DA1_Cleaned_Dataset_1991_2025.csv",
     index=False
 )
 
@@ -148,8 +155,7 @@ print(
 )
 
 # 11. EXPLORATORY DATA ANALYSIS (EDA)
-# Create folder for graphs
-os.makedirs("outputs/graphs", exist_ok=True)
+# Graphs are saved in outputs/annual_data/graphs/
 
 # 11.1 Average Maximum Temperature by Region
 region_temp = (
@@ -181,7 +187,7 @@ plt.title(
 plt.tight_layout()
 
 plt.savefig(
-    "outputs/graphs/01_average_temperature.png",
+    GRAPHS_DIR / "01_average_temperature.png",
     dpi=300
 )
 
@@ -217,7 +223,7 @@ plt.title(
 plt.tight_layout()
 
 plt.savefig(
-    "outputs/graphs/02_average_rainfall.png",
+    GRAPHS_DIR / "02_average_rainfall.png",
     dpi=300
 )
 
@@ -257,7 +263,7 @@ plt.grid(alpha=0.3)
 plt.tight_layout()
 
 plt.savefig(
-    "outputs/graphs/03_temperature_trend.png",
+    GRAPHS_DIR / "03_temperature_trend.png",
     dpi=300
 )
 
@@ -297,7 +303,7 @@ plt.grid(alpha=0.3)
 plt.tight_layout()
 
 plt.savefig(
-    "outputs/graphs/04_rainfall_trend.png",
+    GRAPHS_DIR / "04_rainfall_trend.png",
     dpi=300
 )
 
@@ -343,7 +349,7 @@ plt.title(
 plt.tight_layout()
 
 plt.savefig(
-    "outputs/graphs/05_rainfall_variability.png",
+    GRAPHS_DIR / "05_rainfall_variability.png",
     dpi=300
 )
 
@@ -363,7 +369,7 @@ regional_summary = (
 )
 
 regional_summary.to_csv(
-    "outputs/regional_summary.csv",
+    ANNUAL_OUTPUT_DIR / "regional_summary.csv",
     index=False
 )
 
@@ -489,7 +495,7 @@ print(
 
 # 12.9 Save risk assessment
 risk_df.to_csv(
-    "outputs/ClimateShield_Risk_Assessment.csv",
+    ANNUAL_OUTPUT_DIR / "ClimateShield_Risk_Assessment.csv",
     index=False
 )
 
@@ -553,7 +559,7 @@ plt.title(
 plt.tight_layout()
 
 plt.savefig(
-    "outputs/graphs/06_temperature_warming_trend.png",
+    GRAPHS_DIR / "06_temperature_warming_trend.png",
     dpi=300
 )
 
@@ -562,7 +568,7 @@ plt.show()
 
 # Save results
 trend_df.to_csv(
-    "outputs/temperature_trends.csv",
+    ANNUAL_OUTPUT_DIR / "temperature_trends.csv",
     index=False
 )
 
@@ -592,8 +598,9 @@ plt.grid(
 plt.tight_layout()
 
 plt.savefig(
-    "outputs/graphs/07_temperature_trend_distribution.png",
+    GRAPHS_DIR / "07_temperature_trend_distribution.png",
     dpi=300
 )
 
 plt.show()
+print(f"\nAll annual outputs saved in: {ANNUAL_OUTPUT_DIR}")
