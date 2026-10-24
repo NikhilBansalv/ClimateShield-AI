@@ -1,9 +1,9 @@
 Target,Approach,Validation_MAE
-Temperature,Seasonal Climatology Baseline,0.6328007619047619
-Temperature,Random Forest,0.6395055095918349
-Temperature,Extra Trees,0.6255229464237911
-Temperature,Hist Gradient Boosting,0.8035977812852776
-Precipitation,Seasonal Climatology Baseline,36.199430654372236
-Precipitation,Random Forest,40.49453022749068
-Precipitation,Extra Trees,38.85094925719315
-Precipitation,Hist Gradient Boosting,40.85266416464435
+Temperature,Seasonal Climatology Baseline,0.632800761904762
+Temperature,Ridge Regression,0.5732603450620742
+Temperature,Extra Trees,0.5708375226091017
+Temperature,Hist Gradient Boosting,0.576919054233697
+Precipitation,Seasonal Climatology Baseline,36.60818840529086
+Precipitation,Ridge Regression,36.61128329515123
+Precipitation,Extra Trees,37.023535267294
+Precipitation,Hist Gradient Boosting,37.70648225487145

@@ -1,0 +1,10 @@
+Target,Model,Feature,Importance
+Temperature,Ridge Regression,Lag_1,0.047033417420220804
+Temperature,Ridge Regression,Lag_2,-6.570143380602023e-05
+Temperature,Ridge Regression,Lag_3,0.0030301413645611895
+Temperature,Ridge Regression,Lag_12,-0.00599351257175742
+Temperature,Ridge Regression,Roll_3,0.006117893607637126
+Temperature,Ridge Regression,Roll_12,0.011748775609150131
+Temperature,Ridge Regression,Month_sin,-3.451999032408892e-05
+Temperature,Ridge Regression,Month_cos,-7.079126570666005e-05
+Temperature,Ridge Regression,Climatology,-0.0001067328711377824

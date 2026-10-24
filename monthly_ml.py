@@ -2,50 +2,42 @@ from pathlib import Path
 import re
 import warnings
 
-import joblib
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from sklearn.ensemble import (
-    ExtraTreesRegressor,
-    HistGradientBoostingRegressor,
-    RandomForestRegressor,
-)
+from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore", category=UserWarning)
-
-# =========================================================
-# 1. PATHS AND SETTINGS
-# =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "outputs" / "monthly_ml"
 GRAPH_DIR = OUTPUT_DIR / "graphs"
-MODEL_DIR = OUTPUT_DIR / "models"
 
-for folder in (OUTPUT_DIR, GRAPH_DIR, MODEL_DIR):
+for folder in (OUTPUT_DIR, GRAPH_DIR):
     folder.mkdir(parents=True, exist_ok=True)
 
 START_DATE = pd.Timestamp("1991-01-01")
 END_DATE = pd.Timestamp("2025-12-01")
 VALIDATION_START = pd.Timestamp("2016-01-01")
 TEST_START = pd.Timestamp("2021-01-01")
+FORECAST_YEARS = range(2026, 2036)
+BASELINE = "Seasonal Climatology Baseline"
+TARGETS = ("Temperature", "Precipitation")
+RANDOM_STATE = 42
 
-# =========================================================
-# 2. FIND THE REGIONAL EXCEL FILES
-# =========================================================
+LAG_FEATURES = ["Lag_1", "Lag_2", "Lag_3", "Lag_12", "Roll_3", "Roll_12"]
+FEATURES = LAG_FEATURES + ["Month_sin", "Month_cos", "Climatology"]
 
 def find_regional_file(variable):
-    """
-    Find a monthly Excel file for a variable.
-    Prefer a file with code/name columns and approximately
-    35 regional rows. A country-only India file is rejected.
-    """
     candidates = sorted(DATA_DIR.glob(f"*{variable}*monthly*.xlsx"))
 
     if not candidates:
@@ -74,7 +66,6 @@ def find_regional_file(variable):
             "Check that the ADM1 monthly Excel file is in the data folder."
         )
 
-    # Prefer the file with the most unique regions, then most rows.
     valid.sort(key=lambda item: (item[2], item[1]), reverse=True)
     selected_path, row_count, region_count = valid[0]
 
@@ -87,11 +78,6 @@ def find_regional_file(variable):
     print(f"Selected {variable} file: {selected_path.name}")
     print(f"Rows: {row_count} | Unique regions: {region_count}")
     return selected_path
-
-
-# =========================================================
-# 3. WIDE EXCEL DATA TO LONG MONTHLY DATA
-# =========================================================
 
 def load_monthly_data(file_path, value_name):
     df = pd.read_excel(file_path, sheet_name=0)
@@ -106,14 +92,12 @@ def load_monthly_data(file_path, value_name):
     df["code"] = df["code"].astype(str).str.strip()
     df["name"] = df["name"].astype(str).str.strip()
 
-    # CCKP monthly columns normally use YYYY-MM labels.
     date_columns = [
         col for col in df.columns
         if re.fullmatch(r"\d{4}-\d{2}", col)
     ]
 
     if not date_columns:
-        # Accept columns such as YYYY-MM-DD, if present.
         date_columns = [
             col for col in df.columns
             if re.fullmatch(r"\d{4}-\d{2}-\d{2}", col)
@@ -150,10 +134,125 @@ def load_monthly_data(file_path, value_name):
 
     return long_df[["code", "name", "Date", value_name]]
 
+def make_dataset(data, target, climatology_end):
+    df = data[["code", "name", "Date", "Year", "Month", target]].copy()
+    df = df.sort_values(["name", "Date"]).reset_index(drop=True)
 
-# =========================================================
-# 4. LOAD, MERGE, AND SAVE CLEANED DATA
-# =========================================================
+    climatology = (
+        df[df["Date"] < climatology_end]
+        .groupby(["name", "Month"])[target].mean()
+        .rename("Climatology")
+    )
+    df = df.join(climatology, on=["name", "Month"])
+    df["Anomaly"] = df[target] - df["Climatology"]
+
+    by_region = df.groupby("name")["Anomaly"]
+    for lag in (1, 2, 3, 12):
+        df[f"Lag_{lag}"] = by_region.shift(lag)
+    df["Roll_3"] = by_region.transform(
+        lambda s: s.shift(1).rolling(3, min_periods=2).mean()
+    )
+    df["Roll_12"] = by_region.transform(
+        lambda s: s.shift(1).rolling(12, min_periods=8).mean()
+    )
+    df["Month_sin"] = np.sin(2 * np.pi * df["Month"] / 12)
+    df["Month_cos"] = np.cos(2 * np.pi * df["Month"] / 12)
+
+    return df.dropna(subset=FEATURES + ["Anomaly", target]).copy()
+
+
+def model_factories():
+    return {
+        "Ridge Regression": lambda: make_pipeline(
+            StandardScaler(), Ridge(alpha=10.0)
+        ),
+        "Extra Trees": lambda: ExtraTreesRegressor(
+            n_estimators=200, min_samples_leaf=10,
+            random_state=RANDOM_STATE, n_jobs=-1,
+        ),
+        "Hist Gradient Boosting": lambda: HistGradientBoostingRegressor(
+            max_iter=200, learning_rate=0.05, max_leaf_nodes=15,
+            min_samples_leaf=40, l2_regularization=1.0,
+            random_state=RANDOM_STATE,
+        ),
+    }
+
+
+def to_value(frame, anomaly_prediction, target):
+    value = frame["Climatology"].to_numpy() + anomaly_prediction
+    return np.clip(value, 0, None) if target == "Precipitation" else value
+
+def score(actual, predicted):
+    return (
+        mean_absolute_error(actual, predicted),
+        float(np.sqrt(mean_squared_error(actual, predicted))),
+        r2_score(actual, predicted),
+    )
+
+def project(history, target, future_dates, trend_weight=0.5, widen=1.0):
+    hist = history.dropna(subset=[target]).copy()
+    hist["t"] = hist["Year"] + (hist["Month"] - 1) / 12
+    clim = hist.groupby(["name", "Month"])[target].transform("mean")
+    hist["anom"] = hist[target] - clim
+
+    if target == "Temperature":
+        national = hist.groupby("t")["anom"].mean()
+        national_slope = np.polyfit(national.index, national.values, 1)[0]
+        slopes = {
+            n: trend_weight * np.polyfit(g["t"], g["anom"], 1)[0]
+               + (1 - trend_weight) * national_slope
+            for n, g in hist.groupby("name")
+        }
+    else:
+        slopes = {n: 0.0 for n in hist["name"].unique()}
+    centre = hist.groupby("name")["t"].mean()
+
+    fitted = clim + hist["name"].map(slopes) * (hist["t"] - hist["name"].map(centre))
+    hist["resid"] = hist[target] - fitted
+    q = (
+        hist.groupby(["name", "Month"])["resid"]
+        .quantile([0.10, 0.90]).unstack()
+        .rename(columns={0.10: "q_lo", 0.90: "q_hi"})
+    )
+    month_mean = hist.groupby(["name", "Month"])[target].mean().rename("base")
+
+    out = pd.DataFrame(
+        [(n, d) for n in sorted(slopes) for d in future_dates],
+        columns=["name", "Date"],
+    )
+    out["Month"] = out["Date"].dt.month
+    out["t"] = out["Date"].dt.year + (out["Month"] - 1) / 12
+    out = out.join(month_mean, on=["name", "Month"]).join(q, on=["name", "Month"])
+    out["Prediction"] = out["base"] + out["name"].map(slopes) * (
+        out["t"] - out["name"].map(centre)
+    )
+    out["Lower_80"] = out["Prediction"] + widen * out["q_lo"]
+    out["Upper_80"] = out["Prediction"] + widen * out["q_hi"]
+    if target == "Precipitation":
+        for col in ("Prediction", "Lower_80", "Upper_80"):
+            out[col] = out[col].clip(lower=0)
+    out["Target"] = target
+    out["Year"] = out["Date"].dt.year
+    return out[["name", "Target", "Date", "Year", "Month",
+                "Prediction", "Lower_80", "Upper_80"]]
+
+
+def coverage(projection, data, target):
+    actual = data[["name", "Date", target]].dropna()
+    merged = projection.merge(actual, on=["name", "Date"])
+    inside = merged[target].between(merged["Lower_80"], merged["Upper_80"])
+    return merged, float(inside.mean())
+
+
+def calibrate_widen(data, target):
+    pre = data[data["Date"] < VALIDATION_START]
+    dates = pd.date_range(VALIDATION_START, TEST_START - pd.offsets.MonthBegin(1), freq="MS")
+    best_k, best_gap = 1.0, 9.0
+    for k in np.arange(1.0, 1.61, 0.05):
+        _, cov = coverage(project(pre, target, dates, widen=k), data, target)
+        if abs(cov - 0.80) < best_gap:
+            best_k, best_gap = float(k), abs(cov - 0.80)
+    return best_k
 
 def main():
     print("\n" + "=" * 64)
@@ -166,365 +265,204 @@ def main():
     temperature = load_monthly_data(temp_path, "Temperature")
     precipitation = load_monthly_data(rain_path, "Precipitation")
 
-    print(f"\nTemperature rows: {len(temperature)}")
-    print(f"Precipitation rows: {len(precipitation)}")
-
     data = pd.merge(
-        temperature,
-        precipitation,
-        on=["code", "name", "Date"],
-        how="outer",
-        validate="one_to_one",
+        temperature, precipitation,
+        on=["code", "name", "Date"], how="outer", validate="one_to_one",
     ).sort_values(["name", "Date"]).reset_index(drop=True)
-
     data["Year"] = data["Date"].dt.year
     data["Month"] = data["Date"].dt.month
 
-    print(f"\nMerged shape: {data.shape}")
-    print(f"Regions: {data['name'].nunique()}")
-    print(f"Date range: {data['Date'].min()} to {data['Date'].max()}")
-    print("\nMissing target values:")
+    print(f"\nMerged shape: {data.shape} | Regions: {data['name'].nunique()}")
+    print("Missing target values:")
     print(data[["Temperature", "Precipitation"]].isna().sum())
 
-    # Preserve raw missing values in the cleaned dataset; do not invent rainfall.
-    cleaned_path = OUTPUT_DIR / "monthly_cleaned_dataset_1991_2025.csv"
-    data.to_csv(cleaned_path, index=False)
+    data.to_csv(OUTPUT_DIR / "monthly_cleaned_dataset_1991_2025.csv", index=False)
 
-    missing_report = (
-        data.groupby("name")[["Temperature", "Precipitation"]]
-        .agg(lambda column: int(column.isna().sum()))
-        .reset_index()
-    )
-    missing_report.to_csv(OUTPUT_DIR / "missing_values_report.csv", index=False)
+    (data.groupby("name")[list(TARGETS)]
+         .agg(lambda c: int(c.isna().sum())).reset_index()
+         .to_csv(OUTPUT_DIR / "missing_values_report.csv", index=False))
 
-    monthly_summary = (
-        data.groupby("Month")
-        .agg(
-            Mean_Temperature=("Temperature", "mean"),
-            Mean_Precipitation=("Precipitation", "mean"),
-            Temperature_Std=("Temperature", "std"),
-            Precipitation_Std=("Precipitation", "std"),
-            Temperature_Observations=("Temperature", "count"),
-            Precipitation_Observations=("Precipitation", "count"),
-        )
-        .reset_index()
-    )
-    monthly_summary.to_csv(
-        OUTPUT_DIR / "monthly_climate_summary.csv", index=False
-    )
+    (data.groupby("Month").agg(
+        Mean_Temperature=("Temperature", "mean"),
+        Mean_Precipitation=("Precipitation", "mean"),
+        Temperature_Std=("Temperature", "std"),
+        Precipitation_Std=("Precipitation", "std"),
+        Temperature_Observations=("Temperature", "count"),
+        Precipitation_Observations=("Precipitation", "count"),
+    ).reset_index().to_csv(OUTPUT_DIR / "monthly_climate_summary.csv", index=False))
 
-    # Region one-hot encoding plus seasonal cyclical features.
-    region_dummies = pd.get_dummies(
-        data["name"], prefix="Region", dtype=int
-    )
-    data["Month_sin"] = np.sin(2 * np.pi * data["Month"] / 12)
-    data["Month_cos"] = np.cos(2 * np.pi * data["Month"] / 12)
-
-    feature_columns = [
-        "Year", "Month_sin", "Month_cos"
-    ] + list(region_dummies.columns)
-    model_data = pd.concat([data, region_dummies], axis=1)
-
-    # Save a transparent record of the feature names.
-    pd.Series(feature_columns, name="Feature").to_csv(
+    pd.Series(FEATURES, name="Feature").to_csv(
         OUTPUT_DIR / "model_features.csv", index=False
     )
 
-    model_factories = {
-        "Random Forest": lambda: RandomForestRegressor(
-            n_estimators=250,
-            min_samples_leaf=2,
-            random_state=42,
-            n_jobs=-1,
-        ),
-        "Extra Trees": lambda: ExtraTreesRegressor(
-            n_estimators=250,
-            min_samples_leaf=2,
-            random_state=42,
-            n_jobs=-1,
-        ),
-        "Hist Gradient Boosting": lambda: HistGradientBoostingRegressor(
-            max_iter=150,
-            learning_rate=0.08,
-            max_leaf_nodes=20,
-            l2_regularization=1.0,
-            random_state=42,
-        ),
-    }
+    all_metrics, all_validation, all_predictions = [], [], []
+    selection_summary, importance_rows, projection_rows = [], [], []
+    all_forecasts = []
 
-    all_metrics = []
-    all_predictions = []
-    all_validation_scores = []
-    selected_models = {}
-    selection_summary = []
+    future_dates = pd.date_range(
+        f"{FORECAST_YEARS[0]}-01-01", f"{FORECAST_YEARS[-1]}-12-01", freq="MS"
+    )
+    test_dates = pd.date_range(TEST_START, END_DATE, freq="MS")
 
-    # =====================================================
-    # 5. TRAIN, VALIDATE, SELECT, AND TEST EACH TARGET
-    # =====================================================
-
-    for target in ("Temperature", "Precipitation"):
+    for target in TARGETS:
         print("\n" + "-" * 64)
         print(f"TARGET: {target.upper()}")
         print("-" * 64)
+        unit = "degC" if target == "Temperature" else "mm"
 
-        target_df = model_data.dropna(subset=[target]).copy()
-        target_df = target_df.sort_values("Date")
-
-        train = target_df[target_df["Date"] < VALIDATION_START]
-        validation = target_df[
-            (target_df["Date"] >= VALIDATION_START)
-            & (target_df["Date"] < TEST_START)
-        ]
-        test = target_df[target_df["Date"] >= TEST_START]
-
-        if train.empty or validation.empty or test.empty:
-            raise ValueError(
-                f"Train/validation/test split is empty for {target}. "
-                "Check the downloaded date range."
-            )
-
-        print(f"Training rows (1991–2015): {len(train)}")
-        print(f"Validation rows (2016–2020): {len(validation)}")
-        print(f"Test rows (2021–2025): {len(test)}")
-
-        # Seasonal climatology: region-specific average for each calendar month.
-        # Fit using training data only during model selection.
-        train_climatology = train.groupby(["name", "Month"])[target].mean()
-
-        validation_baseline = np.array([
-            train_climatology.get((row.name, row.Month), np.nan)
-            for row in validation[["name", "Month"]].itertuples(index=False)
-        ], dtype=float)
-
-        valid_baseline_mask = np.isfinite(validation_baseline)
-        if not valid_baseline_mask.any():
-            raise ValueError(f"No valid climatology baseline for {target}.")
-
-        baseline_validation_mae = mean_absolute_error(
-            validation[target].to_numpy()[valid_baseline_mask],
-            validation_baseline[valid_baseline_mask],
-        )
+        ds = make_dataset(data, target, VALIDATION_START)
+        train = ds[ds["Date"] < VALIDATION_START]
+        valid = ds[(ds["Date"] >= VALIDATION_START) & (ds["Date"] < TEST_START)]
+        print(f"Train rows: {len(train)} | Validation rows: {len(valid)}")
 
         validation_scores = [{
-            "Target": target,
-            "Approach": "Seasonal Climatology Baseline",
-            "Validation_MAE": baseline_validation_mae,
+            "Target": target, "Approach": BASELINE,
+            "Validation_MAE": mean_absolute_error(valid[target], valid["Climatology"]),
         }]
-
-        fitted_validation_models = {}
-        print(f"Baseline validation MAE: {baseline_validation_mae:.4f}")
-
-        for model_name, factory in model_factories.items():
-            model = factory()
-            model.fit(train[feature_columns], train[target])
-            val_predictions = model.predict(validation[feature_columns])
-            val_mae = mean_absolute_error(
-                validation[target], val_predictions
-            )
-
+        validation_models = {}
+        for name, factory in model_factories().items():
+            model = factory().fit(train[FEATURES], train["Anomaly"])
+            validation_models[name] = model
+            predicted = to_value(valid, model.predict(valid[FEATURES]), target)
             validation_scores.append({
-                "Target": target,
-                "Approach": model_name,
-                "Validation_MAE": val_mae,
+                "Target": target, "Approach": name,
+                "Validation_MAE": mean_absolute_error(valid[target], predicted),
             })
-            fitted_validation_models[model_name] = model
-            print(f"{model_name} validation MAE: {val_mae:.4f}")
+        all_validation.extend(validation_scores)
 
-        # Select using validation MAE only; final test data is not used
-        # to choose the preferred approach.
-        all_validation_scores.extend(validation_scores)
-        best_validation = min(
-            validation_scores, key=lambda row: row["Validation_MAE"]
-        )
-        selected_name = best_validation["Approach"]
+        best_mae = min(r["Validation_MAE"] for r in validation_scores)
+        complexity = [BASELINE, "Ridge Regression", "Extra Trees", "Hist Gradient Boosting"]
+        eligible = [r for r in validation_scores
+                    if r["Validation_MAE"] <= best_mae * 1.01]
+        best = min(eligible, key=lambda r: complexity.index(r["Approach"]))
+        selected = best["Approach"]
+        baseline_val = validation_scores[0]["Validation_MAE"]
         selection_summary.append({
-            "Target": target,
-            "Selected_Approach": selected_name,
-            "Validation_MAE": best_validation["Validation_MAE"],
-            "Baseline_Validation_MAE": baseline_validation_mae,
+            "Target": target, "Selected_Approach": selected,
+            "Validation_MAE": best["Validation_MAE"],
+            "Baseline_Validation_MAE": baseline_val,
         })
-        print(f"Selected using validation: {selected_name}")
+        print(f"Selected on validation: {selected}")
 
-        # Refit candidate models on all pre-test observations (1991–2020).
-        pretest = target_df[target_df["Date"] < TEST_START]
-        final_train_climatology = pretest.groupby(["name", "Month"])[target].mean()
+        if selected != BASELINE:
+            sample = valid.sample(min(4000, len(valid)), random_state=RANDOM_STATE)
+            imp = permutation_importance(
+                validation_models[selected], sample[FEATURES], sample["Anomaly"],
+                n_repeats=5, random_state=RANDOM_STATE,
+                scoring="neg_mean_absolute_error",
+            )
+            for feat, value in zip(FEATURES, imp.importances_mean):
+                importance_rows.append({
+                    "Target": target, "Model": selected, "Feature": feat,
+                    "Importance": float(value),
+                })
 
-        test_baseline = np.array([
-            final_train_climatology.get((row.name, row.Month), np.nan)
-            for row in test[["name", "Month"]].itertuples(index=False)
-        ], dtype=float)
-        valid_test_baseline = np.isfinite(test_baseline)
+        ds = make_dataset(data, target, TEST_START)
+        pretest = ds[ds["Date"] < TEST_START]
+        test = ds[ds["Date"] >= TEST_START].copy()
+        print(f"Final test rows (2021–2025): {len(test)}")
 
-        baseline_test_predictions = test_baseline.copy()
-        baseline_test_mae = mean_absolute_error(
-            test[target].to_numpy()[valid_test_baseline],
-            baseline_test_predictions[valid_test_baseline],
-        )
-        baseline_test_rmse = np.sqrt(mean_squared_error(
-            test[target].to_numpy()[valid_test_baseline],
-            baseline_test_predictions[valid_test_baseline],
-        ))
-
+        baseline_mae, baseline_rmse, _ = score(test[target], test["Climatology"])
         all_metrics.append({
-            "Target": target,
-            "Approach": "Seasonal Climatology Baseline",
-            "Split": "Final test 2021–2025",
-            "MAE": baseline_test_mae,
-            "RMSE": baseline_test_rmse,
-            "R2": np.nan,
-            "Test_Records": int(valid_test_baseline.sum()),
-            "Selected_On_Validation": selected_name
-                == "Seasonal Climatology Baseline",
+            "Target": target, "Approach": BASELINE,
+            "MAE": baseline_mae, "RMSE": baseline_rmse, "R2": np.nan,
+            "Skill_vs_Baseline_%": 0.0, "Test_Records": len(test),
+            "Selected_On_Validation": selected == BASELINE,
         })
+        test_predictions = {BASELINE: test["Climatology"].to_numpy()}
 
-        # Evaluate every ML model on final test for comparison, but do not
-        # use final test metrics to decide which approach is selected.
-        test_predictions_by_model = {}
-        for model_name, factory in model_factories.items():
-            final_model = factory()
-            final_model.fit(pretest[feature_columns], pretest[target])
-            predictions = final_model.predict(test[feature_columns])
-            test_predictions_by_model[model_name] = predictions
-
-            mae = mean_absolute_error(test[target], predictions)
-            rmse = np.sqrt(mean_squared_error(test[target], predictions))
-            r2 = r2_score(test[target], predictions)
-
+        for name, factory in model_factories().items():
+            model = factory().fit(pretest[FEATURES], pretest["Anomaly"])
+            predicted = to_value(test, model.predict(test[FEATURES]), target)
+            test_predictions[name] = predicted
+            mae, rmse, r2 = score(test[target], predicted)
             all_metrics.append({
-                "Target": target,
-                "Approach": model_name,
-                "Split": "Final test 2021–2025",
-                "MAE": mae,
-                "RMSE": rmse,
+                "Target": target, "Approach": name, "MAE": mae, "RMSE": rmse,
                 "R2": r2,
+                "Skill_vs_Baseline_%": 100 * (1 - mae / baseline_mae),
                 "Test_Records": len(test),
-                "Selected_On_Validation": selected_name == model_name,
+                "Selected_On_Validation": selected == name,
             })
+            print(f"  {name:<24} MAE {mae:.3f} {unit} "
+                  f"(skill {100 * (1 - mae / baseline_mae):+.1f}%)")
+        print(f"  {BASELINE:<24} MAE {baseline_mae:.3f} {unit}")
 
-        if selected_name == "Seasonal Climatology Baseline":
-            selected_predictions = baseline_test_predictions
-            selected_final_model = None
-        else:
-            selected_final_model = model_factories[selected_name]()
-            selected_final_model.fit(pretest[feature_columns], pretest[target])
-            selected_predictions = selected_final_model.predict(
-                test[feature_columns]
-            )
-            joblib.dump(
-                selected_final_model,
-                MODEL_DIR / f"selected_{target.lower()}_model.joblib",
-            )
+        out = test[["code", "name", "Date", "Year", "Month"]].copy()
+        out["Target"] = target
+        out["Actual"] = test[target].to_numpy()
+        out["Predicted"] = test_predictions[selected]
+        out["Baseline"] = test_predictions[BASELINE]
+        out["Absolute_Error"] = (out["Actual"] - out["Predicted"]).abs()
+        out["Selected_Approach"] = selected
+        all_predictions.append(out)
 
-        selected_models[target] = selected_name
-
-        prediction_output = test[
-            ["code", "name", "Date", "Year", "Month", target]
-        ].copy()
-        prediction_output["Predicted"] = selected_predictions
-        prediction_output["Absolute_Error"] = np.abs(
-            prediction_output[target] - prediction_output["Predicted"]
+        pre = data[data["Date"] < TEST_START]
+        widen = calibrate_widen(data, target)
+        backtest = project(pre, target, test_dates, widen=widen)
+        merged, band_coverage = coverage(backtest, data, target)
+        clim_only = merged.merge(
+            pre.groupby(["name", "Month"])[target].mean().rename("clim").reset_index(),
+            on=["name", "Month"],
         )
-        prediction_output["Selected_Approach"] = selected_name
-        all_predictions.append(prediction_output)
-
-        # Plot monthly averages across regions for actual and selected predictions.
-        plot_summary = (
-            prediction_output.groupby("Date")[[target, "Predicted"]]
-            .mean()
-            .reset_index()
-        )
-
+        projection_rows.append({
+            "Target": target,
+            "Projection_MAE_2021_2025": mean_absolute_error(
+                merged[target], merged["Prediction"]),
+            "Climatology_MAE_2021_2025": mean_absolute_error(
+                clim_only[target], clim_only["clim"]),
+            "Interval_Widening_Factor": widen,
+            "Interval_Coverage_80pct": band_coverage,
+            "Test_Records": len(merged),
+        })
+        all_forecasts.append(project(data, target, future_dates, widen=widen))
+        ylabel = "Temperature (°C)" if target == "Temperature" else "Precipitation (mm)"
+        avg = out.groupby("Date")[["Actual", "Predicted", "Baseline"]].mean()
         plt.figure(figsize=(13, 5))
-        plt.plot(
-            plot_summary["Date"], plot_summary[target],
-            label="Actual", linewidth=1.8,
-        )
-        plt.plot(
-            plot_summary["Date"], plot_summary["Predicted"],
-            label=f"Predicted ({selected_name})", linewidth=1.8,
-        )
-        plt.title(
-            f"{target}: Actual vs Selected Approach, 2021–2025"
-        )
-        plt.xlabel("Month")
-        plt.ylabel("Temperature (°C)" if target == "Temperature"
-                   else "Precipitation (mm)")
-        plt.legend()
-        plt.grid(alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(
-            GRAPH_DIR / f"{target.lower()}_actual_vs_predicted.png",
-            dpi=200,
-        )
+        plt.plot(avg.index, avg["Actual"], label="Actual", linewidth=1.8)
+        plt.plot(avg.index, avg["Predicted"], label=f"Selected: {selected}", linewidth=1.8)
+        plt.plot(avg.index, avg["Baseline"], "--", label=BASELINE, linewidth=1.2, alpha=0.7)
+        plt.title(f"{target}: actual vs predicted, regional average, 2021–2025")
+        plt.xlabel("Month"); plt.ylabel(ylabel)
+        plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
+        plt.savefig(GRAPH_DIR / f"{target.lower()}_actual_vs_predicted.png", dpi=200)
         plt.close()
 
-        # Comparison plot for final test MAE.
-        target_metric_rows = [
-            row for row in all_metrics if row["Target"] == target
-        ]
-        comparison = pd.DataFrame(target_metric_rows).sort_values("MAE")
-
+        cmp_df = pd.DataFrame([m for m in all_metrics if m["Target"] == target]).sort_values("MAE")
         plt.figure(figsize=(9, 5))
-        plt.bar(comparison["Approach"], comparison["MAE"])
-        plt.title(f"{target}: Final Test MAE Comparison (2021–2025)")
-        plt.ylabel("MAE (lower is better)")
-        plt.xticks(rotation=15, ha="right")
-        plt.grid(axis="y", alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(
-            GRAPH_DIR / f"{target.lower()}_model_comparison.png",
-            dpi=200,
-        )
+        plt.bar(cmp_df["Approach"], cmp_df["MAE"])
+        plt.title(f"{target}: test MAE by approach (lower is better)")
+        plt.ylabel(f"MAE ({unit})"); plt.xticks(rotation=15, ha="right")
+        plt.grid(axis="y", alpha=0.3); plt.tight_layout()
+        plt.savefig(GRAPH_DIR / f"{target.lower()}_model_comparison.png", dpi=200)
         plt.close()
-
-    # =====================================================
-    # 6. SAVE RESULTS
-    # =====================================================
 
     metrics_df = pd.DataFrame(all_metrics)
-    metrics_df.to_csv(
-        OUTPUT_DIR / "model_evaluation_metrics.csv", index=False
-    )
+    metrics_df.to_csv(OUTPUT_DIR / "model_evaluation_metrics.csv", index=False)
+    pd.DataFrame(all_validation).to_csv(OUTPUT_DIR / "validation_metrics.csv", index=False)
+    pd.DataFrame(selection_summary).to_csv(OUTPUT_DIR / "model_selection_summary.csv", index=False)
+    pd.concat(all_predictions, ignore_index=True).to_csv(
+        OUTPUT_DIR / "test_period_predictions.csv", index=False)
+    pd.DataFrame(importance_rows).to_csv(OUTPUT_DIR / "feature_importance.csv", index=False)
+    pd.DataFrame(projection_rows).to_csv(OUTPUT_DIR / "projection_validation.csv", index=False)
+    pd.concat(all_forecasts, ignore_index=True).to_csv(
+        OUTPUT_DIR / "future_projections_2026_2035.csv", index=False)
 
-    pd.DataFrame(all_validation_scores).to_csv(
-        OUTPUT_DIR / "validation_metrics.csv", index=False
-    )
-    pd.DataFrame(selection_summary).to_csv(
-        OUTPUT_DIR / "model_selection_summary.csv", index=False
-    )
-
-    predictions_df = pd.concat(all_predictions, ignore_index=True)
-    predictions_df.to_csv(
-        OUTPUT_DIR / "test_period_predictions.csv", index=False
-    )
-
-    # Save a simple project status report.
     with open(OUTPUT_DIR / "run_summary.txt", "w", encoding="utf-8") as handle:
         handle.write("ClimateShield AI — Monthly ML pipeline\n")
         handle.write(f"Study period: {START_DATE.date()} to {END_DATE.date()}\n")
-        handle.write("Training: 1991–2015\nValidation: 2016–2020\n")
-        handle.write("Final test: 2021–2025\n\n")
-        for target, approach in selected_models.items():
-            handle.write(f"{target}: selected approach = {approach}\n")
-        handle.write(
-            "\nThese are held-out historical predictions, not forecasts "
-            "for future years.\n"
-        )
+        handle.write("Training: 1991–2015 | Validation: 2016–2020 | Final test: 2021–2025\n\n")
+        for row in selection_summary:
+            handle.write(f"{row['Target']}: selected approach = {row['Selected_Approach']}\n")
+        handle.write("\nOne-month-ahead models predict the anomaly from lagged anomalies.\n"
+                     "Projections for 2026–2035 use climatology + a shrunk warming trend.\n")
 
     print("\n" + "=" * 64)
     print("PIPELINE COMPLETED")
     print("=" * 64)
-    print("\nValidation-based selections:")
-    print(pd.DataFrame(selection_summary).to_string(index=False))
-    print("\nFinal test metrics:")
-    print(metrics_df.to_string(index=False))
+    print(metrics_df.round(3).to_string(index=False))
+    print("\nProjection back-test (fit < 2021, predict 2021–2025):")
+    print(pd.DataFrame(projection_rows).round(3).to_string(index=False))
     print(f"\nOutputs: {OUTPUT_DIR}")
-    print(f"Graphs:  {GRAPH_DIR}")
-    print(f"Models:  {MODEL_DIR}")
-    print(
-        "\nNote: Predictions cover historical test months (2021–2025); "
-        "they are not future forecasts."
-    )
 
 
 if __name__ == "__main__":
